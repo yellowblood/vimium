@@ -27,6 +27,7 @@
     returnScrollPosition: handleReturnScrollPosition,
     getCurrentTabUrl:     getCurrentTabUrl,
     settings:             handleSettings,
+    getBookmarks:         getBookmarks,
     filterCompleter:      filterCompleter,
   };
 
@@ -286,6 +287,12 @@
     else { // operation == "set"
       Settings.set(args.key, args.value);
     }
+  }
+
+  function getBookmarks(args, port) {
+    chrome.bookmarks.search(args.query, function(bookmarks) {
+        port.postMessage({bookmarks:bookmarks})
+    })
   }
 
   function refreshCompleter(request) {
