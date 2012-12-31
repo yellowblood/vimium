@@ -1,12 +1,23 @@
 {
+  "manifest_version": 2,
   "name": "Vimium",
-  "version": "1.34",
+  "version": "1.42",
   "description": "The Hacker's Browser. Vimium provides keyboard shortcuts for navigation and control in the spirit of Vim.",
   "icons": {  "16": "icons/icon16.png",
               "48": "icons/icon48.png",
              "128": "icons/icon128.png" },
-  "background_page": "background_page.html",
-  "options_page": "options.html",
+  "background": {
+    "scripts": [
+      "lib/utils.js",
+      "background_scripts/commands.js",
+      "lib/clipboard.js",
+      "background_scripts/settings.js",
+      "background_scripts/completion.js",
+      "background_scripts/marks.js",
+      "background_scripts/main.js"
+    ]
+  },
+  "options_page": "pages/options.html",
   "permissions": [
     "tabs",
     "bookmarks",
@@ -20,14 +31,21 @@
       "js": ["lib/utils.js",
              "lib/keyboard_utils.js",
              "lib/dom_utils.js",
+             "lib/handler_stack.js",
              "lib/clipboard.js",
              "content_scripts/link_hints.js",
              "content_scripts/vomnibar.js",
+             "content_scripts/scroller.js",
+             "content_scripts/marks.js",
              "content_scripts/vimium_frontend.js"
             ],
-      "css": ["vimium.css"],
+      "css": ["content_scripts/vimium.css"],
       "run_at": "document_start",
       "all_frames": true
     }
-  ]
+  ],
+  "browser_action": {
+    "default_icon": "icons/browser_action_disabled.png",
+    "default_popup": "pages/popup.html"
+  }
 }

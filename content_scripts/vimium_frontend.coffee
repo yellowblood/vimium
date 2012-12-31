@@ -4,7 +4,7 @@
 # background page that we're in domReady and ready to accept normal commands by connectiong to a port named
 # "domReady".
 #
-getCurrentUrlHandlers = [] # function(url)
+window.handlerStack = new HandlerStack
 
 insertModeLock = null
 findMode = false
@@ -12,15 +12,12 @@ findModeQuery = { rawQuery: "" }
 findModeQueryHasResults = false
 findModeAnchorNode = null
 isShowingHelpDialog = false
-handlerStack = []
 keyPort = null
 # Users can disable Vimium on URL patterns via the settings page.
 isEnabledForUrl = true
 # The user's operating system.
 currentCompletionKeys = null
 validFirstKeys = null
-linkHintCss = null
-activatedElement = null
 
 # The types in <input type="..."> that we consider for focusInput command. Right now this is recalculated in
 # each content script. Alternatively we could calculate it once in the background page and use a request to
@@ -45,8 +42,9 @@ settings =
   port: null
   values: {}
   loadedValues: 0
-  valuesToLoad: ["scrollStepSize", "linkHintCharacters", "filterLinkHints", "hideHud", "previousPatterns",
-      "nextPatterns", "findModeRawQuery"]
+  valuesToLoad: ["scrollStepSize", "linkHintCharacters", "linkHintNumbers", "filterLinkHints", "hideHud",
+    "previousPatterns", "nextPatterns", "findModeRawQuery", "regexFindMode", "userDefinedLinkHintCss",
+    "helpDialog_showAdvancedCommands"]
   isLoaded: false
   eventListeners: {}
 
@@ -98,65 +96,36 @@ initializePreDomReady = ->
   settings.addEventListener("load", LinkHints.init.bind(LinkHints))
   settings.load()
 
-  checkIfEnabledForUrl()
+  Scroller.init()
 
-  chrome.extension.sendRequest { handler: "getLinkHintCss" }, (response) ->
-    linkHintCss = response.linkHintCss
+  checkIfEnabledForUrl()
 
   refreshCompletionKeys()
 
   # Send the key to the key handler in the background page.
   keyPort = chrome.extension.connect({ name: "keyDown" })
 
+  requestHandlers =
+    hideUpgradeNotification: -> HUD.hideUpgradeNotification()
+    showUpgradeNotification: (request) -> HUD.showUpgradeNotification(request.version)
+    showHUDforDuration: (request) -> HUD.showForDuration request.text, request.duration
+    toggleHelpDialog: (request) -> toggleHelpDialog(request.dialogHtml, request.frameId)
+    focusFrame: (request) -> if (frameId == request.frameId) then focusThisFrame(request.highlight)
+    refreshCompletionKeys: refreshCompletionKeys
+    getScrollPosition: -> scrollX: window.scrollX, scrollY: window.scrollY
+    setScrollPosition: (request) -> setScrollPosition request.scrollX, request.scrollY
+    executePageCommand: executePageCommand
+    getActiveState: -> { enabled: isEnabledForUrl }
+    disableVimium: disableVimium
+
   chrome.extension.onRequest.addListener (request, sender, sendResponse) ->
-    if (request.name == "hideUpgradeNotification")
-      HUD.hideUpgradeNotification()
-    else if (request.name == "showUpgradeNotification" && isEnabledForUrl)
-      HUD.showUpgradeNotification(request.version)
-    else if (request.name == "showHelpDialog")
-      if (isShowingHelpDialog)
-        hideHelpDialog()
-      else
-        showHelpDialog(request.dialogHtml, request.frameId)
-    else if (request.name == "focusFrame")
-      if (frameId == request.frameId)
-        focusThisFrame(request.highlight)
-    else if (request.name == "refreshCompletionKeys")
-      refreshCompletionKeys(request)
-
-    # Free up the resources used by this open connection.
-    sendResponse({})
-
-  chrome.extension.onConnect.addListener (port, name) ->
-    if (port.name == "executePageCommand")
-      port.onMessage.addListener (args) ->
-        if (frameId == args.frameId)
-          if (args.passCountToFunction)
-            Utils.invokeCommandString(args.command, [args.count])
-          else
-            Utils.invokeCommandString(args.command) for i in [0...args.count]
-
-        refreshCompletionKeys(args)
-    else if (port.name == "getScrollPosition")
-      port.onMessage.addListener (args) ->
-        scrollPort = chrome.extension.connect({ name: "returnScrollPosition" })
-        scrollPort.postMessage
-          scrollX: window.scrollX,
-          scrollY: window.scrollY,
-          currentTab: args.currentTab
-    else if (port.name == "setScrollPosition")
-      port.onMessage.addListener (args) ->
-        if (args.scrollX > 0 || args.scrollY > 0)
-          DomUtils.documentReady(-> window.scrollBy(args.scrollX, args.scrollY))
-    else if (port.name == "returnCurrentTabUrl")
-      port.onMessage.addListener (args) ->
-        getCurrentUrlHandlers.pop()(args.url) if (getCurrentUrlHandlers.length > 0)
-    else if (port.name == "refreshCompletionKeys")
-      port.onMessage.addListener (args) -> refreshCompletionKeys(args.completionKeys)
-    else if (port.name == "getActiveState")
-      port.onMessage.addListener (args) -> port.postMessage({ enabled: isEnabledForUrl })
-    else if (port.name == "disableVimium")
-      port.onMessage.addListener (args) -> disableVimium()
+    # in the options page, we will receive requests from both content and background scripts. ignore those
+    # from the former.
+    return unless sender.tab?.url.startsWith 'chrome-extension://'
+    return unless isEnabledForUrl or request.name == 'getActiveState'
+    sendResponse requestHandlers[request.name](request, sender)
+    # Ensure the sendResponse callback is freed.
+    false
 
 #
 # This is called once the background page has told us that Vimium should be enabled for the current URL.
@@ -221,51 +190,21 @@ enterInsertModeIfElementIsFocused = ->
   if (document.activeElement && isEditable(document.activeElement) && !findMode)
     enterInsertModeWithoutShowingIndicator(document.activeElement)
 
-onDOMActivate = (event) -> activatedElement = event.target
+onDOMActivate = (event) -> handlerStack.bubbleEvent 'DOMActivate', event
 
-#
-# activatedElement is different from document.activeElement -- the latter seems to be reserved mostly for
-# input elements. This mechanism allows us to decide whether to scroll a div or to scroll the whole document.
-#
-scrollActivatedElementBy= (direction, amount) ->
-  # if this is called before domReady, just use the window scroll function
-  if (!document.body)
-    if (direction == "x")
-      window.scrollBy(amount, 0)
-    else
-      window.scrollBy(0, amount)
-    return
+executePageCommand = (request) ->
+  return unless frameId == request.frameId
 
-  # TODO refactor and put this together with the code in getVisibleClientRect
-  isRendered = (element) ->
-    computedStyle = window.getComputedStyle(element, null)
-    return !(computedStyle.getPropertyValue("visibility") != "visible" ||
-        computedStyle.getPropertyValue("display") == "none")
+  if (request.passCountToFunction)
+    Utils.invokeCommandString(request.command, [request.count])
+  else
+    Utils.invokeCommandString(request.command) for i in [0...request.count]
 
-  if (!activatedElement || !isRendered(activatedElement))
-    activatedElement = document.body
+  refreshCompletionKeys(request)
 
-  scrollName = if (direction == "x") then "scrollLeft" else "scrollTop"
-
-  # Chrome does not report scrollHeight accurately for nodes with pseudo-elements of height 0 (bug 110149).
-  # Therefore we just try to increase scrollTop blindly -- if it fails we know we have reached the end of the
-  # content.
-  if (amount != 0)
-    element = activatedElement
-    loop
-      oldScrollValue = element[scrollName]
-      element[scrollName] += amount
-      lastElement = element
-      # we may have an orphaned element. if so, just scroll the body element.
-      element = element.parentElement || document.body
-      break unless (lastElement[scrollName] == oldScrollValue && lastElement != document.body)
-
-  # if the activated element has been scrolled completely offscreen, subsequent changes in its scroll
-  # position will not provide any more visual feedback to the user. therefore we deactivate it so that
-  # subsequent scrolls only move the parent element.
-  rect = activatedElement.getBoundingClientRect()
-  if (rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth)
-    activatedElement = lastElement
+setScrollPosition = (scrollX, scrollY) ->
+  if (scrollX > 0 || scrollY > 0)
+    DomUtils.documentReady(-> window.scrollTo(scrollX, scrollY))
 
 #
 # Called from the backend in order to change frame focus.
@@ -278,19 +217,18 @@ window.focusThisFrame = (shouldHighlight) ->
     setTimeout((-> document.body.style.border = borderWas), 200)
 
 extend window,
-  scrollToBottom: -> window.scrollTo(window.pageXOffset, document.body.scrollHeight)
-  scrollToTop: -> window.scrollTo(window.pageXOffset, 0)
-  scrollToLeft: -> window.scrollTo(0, window.pageYOffset)
-  scrollToRight: -> window.scrollTo(document.body.scrollWidth, window.pageYOffset)
-  scrollUp: -> scrollActivatedElementBy("y", -1 * settings.get("scrollStepSize"))
-  scrollDown: ->
-    scrollActivatedElementBy("y", parseFloat(settings.get("scrollStepSize")))
-  scrollPageUp: -> scrollActivatedElementBy("y", -1 * window.innerHeight / 2)
-  scrollPageDown: -> scrollActivatedElementBy("y", window.innerHeight / 2)
-  scrollFullPageUp: -> scrollActivatedElementBy("y", -window.innerHeight)
-  scrollFullPageDown: -> scrollActivatedElementBy("y", window.innerHeight)
-  scrollLeft: -> scrollActivatedElementBy("x", -1 * settings.get("scrollStepSize"))
-  scrollRight: -> scrollActivatedElementBy("x", parseFloat(settings.get("scrollStepSize")))
+  scrollToBottom: -> Scroller.scrollTo "y", "max"
+  scrollToTop: -> Scroller.scrollTo "y", 0
+  scrollToLeft: -> Scroller.scrollTo "x", 0
+  scrollToRight: -> Scroller.scrollTo "x", "max"
+  scrollUp: -> Scroller.scrollBy "y", -1 * settings.get("scrollStepSize")
+  scrollDown: -> Scroller.scrollBy "y", settings.get("scrollStepSize")
+  scrollPageUp: -> Scroller.scrollBy "y", "viewSize", -1/2
+  scrollPageDown: -> Scroller.scrollBy "y", "viewSize", 1/2
+  scrollFullPageUp: -> Scroller.scrollBy "y", "viewSize", -1
+  scrollFullPageDown: -> Scroller.scrollBy "y", "viewSize"
+  scrollLeft: -> Scroller.scrollBy "x", -1 * settings.get("scrollStepSize")
+  scrollRight: -> Scroller.scrollBy "x", settings.get("scrollStepSize")
 
 extend window,
   reload: -> window.location.reload()
@@ -309,43 +247,76 @@ extend window,
       window.location.href = urlsplit.join('/')
 
   toggleViewSource: ->
-    toggleViewSourceCallback = (url) ->
+    chrome.extension.sendRequest { handler: "getCurrentTabUrl" }, (url) ->
       if (url.substr(0, 12) == "view-source:")
         url = url.substr(12, url.length - 12)
       else
         url = "view-source:" + url
       chrome.extension.sendRequest({ handler: "openUrlInNewTab", url: url, selected: true })
-    getCurrentUrlHandlers.push(toggleViewSourceCallback)
-    getCurrentUrlPort = chrome.extension.connect({ name: "getCurrentTabUrl" })
-    getCurrentUrlPort.postMessage({})
 
   copyCurrentUrl: ->
-    # TODO(ilya): When the following bug is fixed, revisit this approach of sending back to the background page
-    # to copy.
+    # TODO(ilya): When the following bug is fixed, revisit this approach of sending back to the background
+    # page to copy.
     # http://code.google.com/p/chromium/issues/detail?id=55188
-    # getCurrentUrlHandlers.push(function (url) { Clipboard.copy(url); })
-    getCurrentUrlHandlers.push((url) -> chrome.extension.sendRequest({ handler: "copyToClipboard", data: url }))
-
-    # TODO(ilya): Convert to sendRequest.
-    getCurrentUrlPort = chrome.extension.connect({ name: "getCurrentTabUrl" })
-    getCurrentUrlPort.postMessage({})
+    chrome.extension.sendRequest { handler: "getCurrentTabUrl" }, (url) ->
+      chrome.extension.sendRequest { handler: "copyToClipboard", data: url }
 
     HUD.showForDuration("Yanked URL", 1000)
 
   focusInput: (count) ->
-    results = DomUtils.evaluateXPath(textInputXPath, XPathResult.ORDERED_NODE_ITERATOR_TYPE)
+    # Focus the first input element on the page, and create overlays to highlight all the input elements, with
+    # the currently-focused element highlighted specially. Tabbing will shift focus to the next input element.
+    # Pressing any other key will remove the overlays and the special tab behavior.
+    resultSet = DomUtils.evaluateXPath(textInputXPath, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE)
+    visibleInputs =
+      for i in [0...resultSet.snapshotLength] by 1
+        element = resultSet.snapshotItem(i)
+        rect = DomUtils.getVisibleClientRect(element)
+        continue if rect == null
+        { element: element, rect: rect }
 
-    lastInputBox
-    i = 0
+    return if visibleInputs.length == 0
 
-    while (i < count)
-      currentInputBox = results.iterateNext()
-      break unless currentInputBox
-      continue if (DomUtils.getVisibleClientRect(currentInputBox) == null)
-      lastInputBox = currentInputBox
-      i += 1
+    selectedInputIndex = Math.min(count - 1, visibleInputs.length - 1)
 
-    lastInputBox.focus() if lastInputBox
+    visibleInputs[selectedInputIndex].element.focus()
+
+    return if visibleInputs.length == 1
+
+    hints = for tuple in visibleInputs
+      hint = document.createElement("div")
+      hint.className = "vimiumReset internalVimiumInputHint vimiumInputHint"
+
+      # minus 1 for the border
+      hint.style.left = (tuple.rect.left - 1) + window.scrollX + "px"
+      hint.style.top = (tuple.rect.top - 1) + window.scrollY  + "px"
+      hint.style.width = tuple.rect.width + "px"
+      hint.style.height = tuple.rect.height + "px"
+
+      hint
+
+    hints[selectedInputIndex].classList.add 'internalVimiumSelectedInputHint'
+
+    hintContainingDiv = DomUtils.addElementList(hints,
+      { id: "vimiumInputMarkerContainer", className: "vimiumReset" })
+
+    handlerStack.push keydown: (event) ->
+      if event.keyCode == KeyboardUtils.keyCodes.tab
+        hints[selectedInputIndex].classList.remove 'internalVimiumSelectedInputHint'
+        if event.shiftKey
+          if --selectedInputIndex == -1
+            selectedInputIndex = hints.length - 1
+        else
+          if ++selectedInputIndex == hints.length
+            selectedInputIndex = 0
+        hints[selectedInputIndex].classList.add 'internalVimiumSelectedInputHint'
+        visibleInputs[selectedInputIndex].element.focus()
+      else unless event.keyCode == KeyboardUtils.keyCodes.shiftKey
+        DomUtils.removeElement hintContainingDiv
+        @remove()
+        return true
+
+      false
 
 #
 # Sends everything except i & ESC to the handler in background_page. i & ESC are special because they control
@@ -355,7 +326,7 @@ extend window,
 # Note that some keys will only register keydown events and not keystroke events, e.g. ESC.
 #
 onKeypress = (event) ->
-  return unless bubbleEvent('keypress', event)
+  return unless handlerStack.bubbleEvent('keypress', event)
 
   keyChar = ""
 
@@ -371,32 +342,15 @@ onKeypress = (event) ->
     if (keyChar)
       if (findMode)
         handleKeyCharForFindMode(keyChar)
-        suppressEvent(event)
+        DomUtils.suppressEvent(event)
       else if (!isInsertMode() && !findMode)
         if (currentCompletionKeys.indexOf(keyChar) != -1)
-          suppressEvent(event)
+          DomUtils.suppressEvent(event)
 
         keyPort.postMessage({ keyChar:keyChar, frameId:frameId })
 
-#
-# Called whenever we receive a key event.  Each individual handler has the option to stop the event's
-# propagation by returning a falsy value.
-#
-bubbleEvent = (type, event) ->
-  for i in [(handlerStack.length - 1)..0]
-    # We need to check for existence of handler because the last function call may have caused the release of
-    # more than one handler.
-    if (handlerStack[i] && handlerStack[i][type] && !handlerStack[i][type](event))
-      suppressEvent(event)
-      return false
-  true
-
-suppressEvent = (event) ->
-  event.preventDefault()
-  event.stopPropagation()
-
 onKeydown = (event) ->
-  return unless bubbleEvent('keydown', event)
+  return unless handlerStack.bubbleEvent('keydown', event)
 
   keyChar = ""
 
@@ -432,20 +386,20 @@ onKeydown = (event) ->
       if (isEditable(event.srcElement))
         event.srcElement.blur()
       exitInsertMode()
-      suppressEvent(event)
+      DomUtils.suppressEvent(event)
 
   else if (findMode)
     if (KeyboardUtils.isEscape(event))
       handleEscapeForFindMode()
-      suppressEvent(event)
+      DomUtils.suppressEvent(event)
 
     else if (event.keyCode == keyCodes.backspace || event.keyCode == keyCodes.deleteKey)
       handleDeleteForFindMode()
-      suppressEvent(event)
+      DomUtils.suppressEvent(event)
 
     else if (event.keyCode == keyCodes.enter)
       handleEnterForFindMode()
-      suppressEvent(event)
+      DomUtils.suppressEvent(event)
 
     else if (!modifiers)
       event.stopPropagation()
@@ -456,7 +410,7 @@ onKeydown = (event) ->
   else if (!isInsertMode() && !findMode)
     if (keyChar)
       if (currentCompletionKeys.indexOf(keyChar) != -1)
-        suppressEvent(event)
+        DomUtils.suppressEvent(event)
 
       keyPort.postMessage({ keyChar:keyChar, frameId:frameId })
 
@@ -469,13 +423,13 @@ onKeydown = (event) ->
   #
   # Subject to internationalization issues since we're using keyIdentifier instead of charCode (in keypress).
   #
-  # TOOD(ilya): Revisit @ Not sure it's the absolute best approach.
+  # TOOD(ilya): Revisit this. Not sure it's the absolute best approach.
   if (keyChar == "" && !isInsertMode() &&
      (currentCompletionKeys.indexOf(KeyboardUtils.getKeyChar(event)) != -1 ||
       isValidFirstKey(KeyboardUtils.getKeyChar(event))))
     event.stopPropagation()
 
-onKeyup = () -> return unless bubbleEvent('keyup', event)
+onKeyup = (event) -> return unless handlerStack.bubbleEvent('keyup', event)
 
 checkIfEnabledForUrl = ->
   url = window.location.toString()
@@ -563,12 +517,15 @@ updateFindModeQuery = ->
   # the query can be treated differently (e.g. as a plain string versus regex depending on the presence of
   # escape sequences. '\' is the escape character and needs to be escaped itself to be used as a normal
   # character. here we grep for the relevant escape sequences.
-  findModeQuery.isRegex = false
+  findModeQuery.isRegex = settings.get 'regexFindMode'
   hasNoIgnoreCaseFlag = false
   findModeQuery.parsedQuery = findModeQuery.rawQuery.replace /\\./g, (match) ->
     switch (match)
       when "\\r"
         findModeQuery.isRegex = true
+        return ""
+      when "\\R"
+        findModeQuery.isRegex = false
         return ""
       when "\\I"
         hasNoIgnoreCaseFlag = true
@@ -692,7 +649,8 @@ selectFoundInputElement = ->
   # instead. however, since the last focused element might not be the one currently pointed to by find (e.g.
   # the current one might be disabled and therefore unable to receive focus), we use the approximate
   # heuristic of checking that the last anchor node is an ancestor of our element.
-  if (findModeQueryHasResults && DomUtils.isSelectable(document.activeElement) &&
+  if (findModeQueryHasResults && document.activeElement &&
+      DomUtils.isSelectable(document.activeElement) &&
       isDOMDescendant(findModeAnchorNode, document.activeElement))
     DomUtils.simulateSelect(document.activeElement)
     # the element has already received focus via find(), so invoke insert mode manually
@@ -730,12 +688,13 @@ findAndFocus = (backwards) ->
 
   # if we have found an input element via 'n', pressing <esc> immediately afterwards sends us into insert
   # mode
-  elementCanTakeInput = DomUtils.isSelectable(document.activeElement) &&
+  elementCanTakeInput = document.activeElement &&
+    DomUtils.isSelectable(document.activeElement) &&
     isDOMDescendant(findModeAnchorNode, document.activeElement)
   if (elementCanTakeInput)
     handlerStack.push({
       keydown: (event) ->
-        handlerStack.pop()
+        @remove()
         if (KeyboardUtils.isEscape(event))
           DomUtils.simulateSelect(document.activeElement)
           enterInsertModeWithoutShowingIndicator(document.activeElement)
@@ -780,7 +739,7 @@ findAndFollowLink = (linkStrings) ->
 
   # at the end of this loop, candidateLinks will contain all visible links that match our patterns
   # links lower in the page are more likely to be the ones we want, so we loop through the snapshot backwards
-  for i in [(links.snapshotLength - 1)..0]
+  for i in [(links.snapshotLength - 1)..0] by -1
     link = links.snapshotItem(i)
 
     # ensure link is visible (we don't mind if it is scrolled offscreen)
@@ -803,7 +762,8 @@ findAndFollowLink = (linkStrings) ->
 
   return if (candidateLinks.length == 0)
 
-  wordCount = (link) -> link.innerText.trim().split(/\s+/).length
+  for link in candidateLinks
+    link.wordCount = link.innerText.trim().split(/\s+/).length
 
   # We can use this trick to ensure that Array.sort is stable. We need this property to retain the reverse
   # in-page order of the links.
@@ -814,26 +774,20 @@ findAndFollowLink = (linkStrings) ->
   candidateLinks =
     candidateLinks
       .sort((a, b) ->
-        wcA = wordCount(a)
-        wcB = wordCount(b)
-        if (wcA == wcB) then a.originalIndex - b.originalIndex else wcA - wcB
+        if (a.wordCount == b.wordCount) then a.originalIndex - b.originalIndex else a.wordCount - b.wordCount
       )
-      .filter((a) -> wordCount(a) <= wordCount(candidateLinks[0]) + 1)
+      .filter((a) -> a.wordCount <= candidateLinks[0].wordCount + 1)
 
-  # try to get exact word matches first
   for linkString in linkStrings
+    exactWordRegex =
+      if /\b/.test(linkString[0]) or /\b/.test(linkString[linkString.length - 1])
+        new RegExp "\\b" + linkString + "\\b", "i"
+      else
+        new RegExp linkString, "i"
     for candidateLink in candidateLinks
-      exactWordRegex = new RegExp("\\b" + linkString + "\\b", "i")
       if (exactWordRegex.test(candidateLink.innerText))
         followLink(candidateLink)
         return true
-
-  for linkString in linkStrings
-    for candidateLink in candidateLinks
-      if (candidateLink.innerText.toLowerCase().indexOf(linkString) != -1)
-        followLink(candidateLink)
-        return true
-
   false
 
 findAndFollowRel = (value) ->
@@ -847,12 +801,12 @@ findAndFollowRel = (value) ->
 
 window.goPrevious = ->
   previousPatterns = settings.get("previousPatterns") || ""
-  previousStrings = previousPatterns.split(",")
+  previousStrings = previousPatterns.split(",").filter((s) -> s.length)
   findAndFollowRel("prev") || findAndFollowLink(previousStrings)
 
 window.goNext = ->
   nextPatterns = settings.get("nextPatterns") || ""
-  nextStrings = nextPatterns.split(",")
+  nextStrings = nextPatterns.split(",").filter((s) -> s.length)
   findAndFollowRel("next") || findAndFollowLink(nextStrings)
 
 showFindModeHUDForQuery = ->
@@ -881,13 +835,40 @@ window.showHelpDialog = (html, fid) ->
 
   container.innerHTML = html
   container.getElementsByClassName("closeButton")[0].addEventListener("click", hideHelpDialog, false)
+  
+  VimiumHelpDialog =
+    # This setting is pulled out of local storage. It's false by default.
+    getShowAdvancedCommands: -> settings.get("helpDialog_showAdvancedCommands")
+
+    init: () ->
+      this.dialogElement = document.getElementById("vimiumHelpDialog")
+      this.dialogElement.getElementsByClassName("toggleAdvancedCommands")[0].addEventListener("click",
+        VimiumHelpDialog.toggleAdvancedCommands, false)
+      this.dialogElement.style.maxHeight = window.innerHeight - 80
+      this.showAdvancedCommands(this.getShowAdvancedCommands())
+
+    #
+    # Advanced commands are hidden by default so they don't overwhelm new and casual users.
+    #
+    toggleAdvancedCommands: (event) ->
+      event.preventDefault()
+      showAdvanced = VimiumHelpDialog.getShowAdvancedCommands()
+      VimiumHelpDialog.showAdvancedCommands(!showAdvanced)
+      settings.set("helpDialog_showAdvancedCommands", !showAdvanced)
+
+    showAdvancedCommands: (visible) ->
+      VimiumHelpDialog.dialogElement.getElementsByClassName("toggleAdvancedCommands")[0].innerHTML =
+        if visible then "Hide advanced commands" else "Show advanced commands"
+      advancedEls = VimiumHelpDialog.dialogElement.getElementsByClassName("advanced")
+      for el in advancedEls
+        el.style.display = if visible then "table-row" else "none"
+
+  VimiumHelpDialog.init()
+
   container.getElementsByClassName("optionsPage")[0].addEventListener("click",
     -> chrome.extension.sendRequest({ handler: "openOptionsPageInNewTab" })
     false)
 
-  # This is necessary because innerHTML does not evaluate javascript embedded in <script> tags.
-  scripts = Array.prototype.slice.call(container.getElementsByTagName("script"))
-  scripts.forEach((script) -> eval(script.text))
 
 hideHelpDialog = (clickEvent) ->
   isShowingHelpDialog = false
@@ -896,6 +877,12 @@ hideHelpDialog = (clickEvent) ->
     helpDialog.parentNode.removeChild(helpDialog)
   if (clickEvent)
     clickEvent.preventDefault()
+
+toggleHelpDialog = (html, fid) ->
+  if (isShowingHelpDialog)
+    hideHelpDialog()
+  else
+    showHelpDialog(html, fid)
 
 #
 # A heads-up-display (HUD) for showing Vimium page operations.
@@ -923,9 +910,10 @@ HUD =
     HUD.displayElement().style.display = ""
 
   showUpgradeNotification: (version) ->
-    HUD.upgradeNotificationElement().innerHTML = "Vimium has been updated to " +
-      "<a class='vimiumReset' href='https://chrome.google.com/extensions/detail/dbepggeogbaibhgnhhndojpepiihcmeb'>" +
-      version + "</a>.<a class='vimiumReset close-button' href='#'>x</a>"
+    HUD.upgradeNotificationElement().innerHTML = "Vimium has been updated to
+      <a class='vimiumReset'
+      href='https://chrome.google.com/extensions/detail/dbepggeogbaibhgnhhndojpepiihcmeb'>
+      #{version}</a>.<a class='vimiumReset close-button' href='#'>x</a>"
     links = HUD.upgradeNotificationElement().getElementsByTagName("a")
     links[0].addEventListener("click", HUD.onUpdateLinkClicked, false)
     links[1].addEventListener "click", (event) ->
@@ -1003,20 +991,6 @@ Tween =
       value = (elapsed / state.duration)  * (state.to - state.from) + state.from
       state.onUpdate(value)
 
-#
-# Adds the given CSS to the page.
-#
-addCssToPage = (css, id) ->
-  head = document.getElementsByTagName("head")[0]
-  if (!head)
-    head = document.createElement("head")
-    document.documentElement.appendChild(head)
-  style = document.createElement("style")
-  style.id = id
-  style.type = "text/css"
-  style.appendChild(document.createTextNode(css))
-  head.appendChild(style)
-
 initializePreDomReady()
 window.addEventListener("DOMContentLoaded", initializeOnDomReady)
 
@@ -1026,12 +1000,8 @@ window.onbeforeunload = ->
     scrollX: window.scrollX
     scrollY: window.scrollY)
 
-# TODO(philc): Export a more tighter, more coherent interface.
 root = exports ? window
-root.window = window
 root.settings = settings
-root.linkHintCss = linkHintCss
-root.addCssToPage = addCssToPage
 root.HUD = HUD
 root.handlerStack = handlerStack
 root.frameId = frameId

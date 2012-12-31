@@ -1,7 +1,7 @@
 Commands =
   init: ->
-    for command of commandDescriptions
-      @addCommand(command, commandDescriptions[command][0], commandDescriptions[command][1])
+    for command, description of commandDescriptions
+      @addCommand(command, description[0], description[1])
 
   availableCommands: {}
   keyToCommandRegistry: {}
@@ -12,8 +12,8 @@ Commands =
   #  - passCountToFunction: true if this command should have any digits which were typed prior to the
   #    command passed to it. This is used to implement e.g. "closing of 3 tabs".
   addCommand: (command, description, options) ->
-    if @availableCommands[command]
-      console.log(command, "is already defined! Check commands.js for duplicates.")
+    if command of @availableCommands
+      console.log(command, "is already defined! Check commands.coffee for duplicates.")
       return
 
     options ||= {}
@@ -43,32 +43,32 @@ Commands =
   # On the other hand, <c-a> and <c-A> are different named keys - for one of
   # them you have to press "shift" as well.
   normalizeKey: (key) ->
-      key.replace(/<[acm]-/ig, (match) -> match.toLowerCase())
-          .replace(/<([acm]-)?([a-zA-Z0-9]{2,5})>/g, (match, optionalPrefix, keyName) ->
-            "<" + (if optionalPrefix then optionalPrefix else "") + keyName.toLowerCase() + ">")
+    key.replace(/<[acm]-/ig, (match) -> match.toLowerCase())
+       .replace(/<([acm]-)?([a-zA-Z0-9]{2,5})>/g, (match, optionalPrefix, keyName) ->
+          "<" + (if optionalPrefix then optionalPrefix else "") + keyName.toLowerCase() + ">")
 
   parseCustomKeyMappings: (customKeyMappings) ->
     lines = customKeyMappings.split("\n")
 
     for line in lines
       continue if (line[0] == "\"" || line[0] == "#")
-      split_line = line.split(/\s+/)
+      splitLine = line.split(/\s+/)
 
-      lineCommand = split_line[0]
+      lineCommand = splitLine[0]
 
       if (lineCommand == "map")
-        continue if (split_line.length != 3)
-        key = @normalizeKey(split_line[1])
-        vimiumCommand = split_line[2]
+        continue if (splitLine.length != 3)
+        key = @normalizeKey(splitLine[1])
+        vimiumCommand = splitLine[2]
 
         continue unless @availableCommands[vimiumCommand]
 
         console.log("Mapping", key, "to", vimiumCommand)
         @mapKeyToCommand(key, vimiumCommand)
       else if (lineCommand == "unmap")
-        continue if (split_line.length != 2)
+        continue if (splitLine.length != 2)
 
-        key = @normalizeKey(split_line[1])
+        key = @normalizeKey(splitLine[1])
         console.log("Unmapping", key)
         @unmapKey(key)
       else if (lineCommand == "unmapAll")
@@ -91,8 +91,9 @@ Commands =
        "openCopiedUrlInCurrentTab", "openCopiedUrlInNewTab", "goUp",
        "enterInsertMode", "focusInput",
        "LinkHints.activateMode", "LinkHints.activateModeToOpenInNewTab", "LinkHints.activateModeWithQueue",
-       "Vomnibar.activate", "Vomnibar.activateWithCurrentUrl", "Vomnibar.activateTabSelection",
-       "goPrevious", "goNext", "nextFrame"]
+       "Vomnibar.activate", "Vomnibar.activateInNewTab", "Vomnibar.activateTabSelection",
+       "Vomnibar.activateBookmarks", "Vomnibar.activateBookmarksInNewTab",
+       "goPrevious", "goNext", "nextFrame", "Marks.activateCreateMode", "Marks.activateGotoMode"]
     findCommands: ["enterFindMode", "performFind", "performBackwardsFind"]
     historyNavigation:
       ["goBack", "goForward"]
@@ -107,7 +108,7 @@ Commands =
   advancedCommands: [
     "scrollToLeft", "scrollToRight",
     "goUp", "focusInput", "LinkHints.activateModeWithQueue",
-    "goPrevious", "goNext"]
+    "goPrevious", "goNext", "Marks.activateCreateMode", "Marks.activateGotoMode"]
 
 defaultKeyMappings =
   "?": "showHelp"
@@ -164,11 +165,17 @@ defaultKeyMappings =
   "X": "restoreTab"
 
   "o": "Vomnibar.activate"
-  "O": "Vomnibar.activateWithCurrentUrl"
+  "O": "Vomnibar.activateInNewTab"
 
   "T": "Vomnibar.activateTabSelection"
 
+  "b": "Vomnibar.activateBookmarks"
+  "B": "Vomnibar.activateBookmarksInNewTab"
+
   "gf": "nextFrame"
+
+  "m": "Marks.activateCreateMode"
+  "`": "Marks.activateGotoMode"
 
 
 # This is a mapping of: commandIdentifier => [description, options].
@@ -229,10 +236,15 @@ commandDescriptions =
   restoreTab: ["Restore closed tab", { background: true }]
 
   "Vomnibar.activate": ["Open URL, bookmark, or history entry"]
-  "Vomnibar.activateWithCurrentUrl": ["Open URL, bookmark, history entry, starting with the current URL"]
+  "Vomnibar.activateInNewTab": ["Open URL, bookmark, history entry, in a new tab"]
   "Vomnibar.activateTabSelection": ["Search through your open tabs"]
+  "Vomnibar.activateBookmarks": ["Open a bookmark"]
+  "Vomnibar.activateBookmarksInNewTab": ["Open a bookmark in a new tab"]
 
   nextFrame: ["Cycle forward to the next frame on the page", { background: true, passCountToFunction: true }]
+
+  "Marks.activateCreateMode": ["Create a new mark"]
+  "Marks.activateGotoMode": ["Go to a mark"]
 
 Commands.init()
 
